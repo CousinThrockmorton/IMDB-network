@@ -1,0 +1,907 @@
+---
+title: "Movie Profit Prediction a Dynamic Network Approach"
+author: "ID:1806561"
+date: "20/05/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### Word Count : 1498
+
+
+## Introduction
+
+The world of movies has a large history with graph theory, take for instance, the popular game of “Six Degrees of Kevin Bacon” (Hopkins, 2004). The game's goal is to connect movie actors to the Hollywood actor Kevin Bacon using a simple rule if actors were in a movie, they are connected. For instance, in Apollo 13, Kevin Bacon is Jack Swigert as the pilot while Tom Hanks plays Jim Lowell, the commander. Therefore, they are directly connected. Actors connected to Tom Hanks but not Kevin Bacon, such as Vin Diesel, who appeared in Saving Private Ryan, have a Kevin Bacon degree of 2. The game is based on the popular concept of Six Degrees of Separation: everyone in the world is connected to everyone in just six connections; this works because of the small-world phenomenon (Collins & Chow, 1998). That is the game works because of the long and successful career of Kevin Bacon, where he worked on several films with other similarly popular actors. While most past papers relied of previous box office revenues to measure actor’s notoriety. Only a few papers, such as (Lash & Zhao, 2016), utilised a dynamic network approach to predict movie success, finding significant contribution of various social network measures to movie success. Therefore, it is an interesting question whether these networks of actors are predictive of movies success.
+
+The movie industry is notorious for the high risks and rewards of movie production and its transparency, generating a large amount of data. Therefore, extensive literature exists aiming to predict movie revenues using various methods. The title of movies (Bae and Kim, 2019), the description of the movies (Flora, Lampo and Yang, 2015), various social media responses (Bhave et al., 2015), combined with various machine learning methods (Lee et al., 2018; Ahmad et al., 2020) have been used.
+
+This paper aims to present the case for improving movie revenue prediction utilising the network of actors in combination with machine learning techniques. A better prediction of movie success based on pre-release characteristics can reduce the risk of losses and enable better movie production.
+
+The estimation strategy
+
+1.	A dynamic network of all cast members is created.
+
+2.	Several estimation methods are fitted, optimised, and evaluated.
+
+3.	Selected Model is further analysed to understand feature importance.
+
+
+```{r loading pacakages, include=TRUE, results='hide', message=FALSE}
+#data management
+library(tidyverse)
+library(reshape2)
+library(rlang)
+library(quantmod)
+#building networks
+library(network)
+library(networkDynamic)
+library(sna)
+library(tsna)
+#analysis 
+library(tictoc)
+library(glmnet)
+library(caret)
+library(hdm)
+library(randomForest)
+#plotting the results
+library(ggplot2)
+library(coefplot)
+library(ggpubr)
+#setting the seed for reproducability
+set.seed(100)
+```
+## Dataset
+
+The dataset used in this paper is a publicly available dataset from Kaggle created by Leone (2020) by scraping movies from the Internet Movie Database (IMDb) with more than 100 votes as of 01/01/2020. To my knowledge, this is the most comprehensive pre-cleaned dataset that is available currently. Many variables had to be recoded, such as the genre, the locations, languages, release date. The income and the budget of the movies had to be transformed to US dollars at the current exchange rate.
+
+```{r loading, include=TRUE, results='hide'}
+IMDB<-read.csv("~/EC340/IMDb movies.csv")
+Actors<-read.csv("~/EC340/IMDb names.csv")
+#these are available at : https://www.kaggle.com/stefanoleone992/imdb-extensive-dataset
+```
+
+```{r fixing actor data, include=TRUE, results='hide'}
+#Fixing the Actor atributes data
+Actors$year_of_birth<-str_extract(Actors$date_of_birth, "\\d{4}")
+Actors$year_of_death<-str_extract(Actors$date_of_death, "\\d{4}")
+Actor_dates <- Actors %>% dplyr::select(name, year_of_death)
+Actor_dates$name <- str_trim(Actor_dates$name, side = c("both"))
+```
+
+This research is seriously constrained by the missing values in the dataset, specifically income and budget. Specifically, I cannot use observations when either is missing. It is important to note that this not without a cost, as income is positively correlated with being included in the subsample used.
+
+```{r fixing income variables, include=TRUE, results='hide', message=FALSE}
+##Fixing the income and budget variables by converting them to USA dollars at the current or last known exchange rate
+IMDB$is_income<-grepl("\\d", IMDB$worlwide_gross_income)
+IMDB$is_budget<-grepl("\\d", IMDB$budget)
+
+#Splitting the numbers from the currency indicators
+IMDB<-str_split_fixed(IMDB$worlwide_gross_income, "\\s", n =2) %>% cbind(IMDB,.)
+IMDB<-IMDB %>% rename(gross_income= `2`, currency=`1`)
+IMDB$gross_income <- IMDB$gross_income %>% as.numeric()
+IMDB<-str_split_fixed(IMDB$usa_gross_income, "\\s", n =2) %>% cbind(IMDB,.)
+IMDB<-IMDB %>% rename(gross_income_us= `2`, currency_us=`1`)
+IMDB$gross_income_us <- IMDB$gross_income_us %>% as.numeric()
+table(is.na(IMDB$gross_income), is.na(IMDB$gross_income_us))
+#some(1158) have income just on the international some on the US level, I will append my data with those films that only have income recorded in the US
+IMDB<-str_split_fixed(IMDB$budget, "\\s", n =2) %>% cbind(IMDB,.)
+IMDB<-IMDB %>% rename(gross_budget= `2`, currency_budget = `1`)
+IMDB$gross_budget <- IMDB$gross_budget %>% as.numeric()
+#several currencies are used for income and budget, so I will convert them to US dollars at the current exchange rate (bit curde but easier than historical exchange rates and adjusting for inflation)
+
+#getting current exchange rate data, note, some of the currencies in the dataset are out of circulation, for these the API gives the latest figure
+from<-c("AED","AMD","ARS","AUD","BDT","BND","BRL","CAD","CHF","CLP","CNY","COP","CZK","DEM","DKK","DOP","EGP","EUR","FRF","GBP","HKD","HUF","IDR","IEP","ILS","INR","IRR","ISK","ITL","JPY","KRW","LTL","LVL","MXN","MYR","NGN","NOK","NZD","PHP","PKR","PLN","RON","RUB","SEK","SGD","THB","TRY","TWD","UAH","YER","ZAR","USD")
+#some currencies don't exist anymore such as SKK(Slovak koruna) VEB(Venezulean bolivar) NLG(dutch guilder) FIM(Finnish markka) ESP(is the old Spanish currency discontinued in 1999) EEK(Estonian kroon) ATS(Austrian schilling) BEF(Belgian franc) BGL(bulgarian lev) HRK (Croatian kuna)
+IMDB$currency_budget %>% table()
+#IMDB_ESP <- IMDB %>% filter(str_detect(IMDB$currency_budget, "ESP"))
+#ESP or peseta is discontinued and doesn't associate with a currency there are, since I can't resolve this I will exclude all of these Spanish films, I could transform them to euro then transform that but hat would be even more strached given there are only 35 of these, out of which 5 make it to the final as they have both income and budget recorded
+IMDB <- IMDB %>% filter(!str_detect(IMDB$currency_budget, "ESP"))
+
+IMDB$currency_budget <- IMDB$currency_budget %>% str_replace_all("RUR","RUB")  %>% str_replace_all("TRL","TRY") %>% str_replace_all("HRK","HRV")
+to<-c("USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD","USD")
+#getting the exchange rates for the currencies
+Convert<-getQuote(paste0(from,to, "=X")) %>% rownames_to_column()
+Convert$rowname<-Convert$rowname %>% str_remove_all("USD=X")
+Convert <- Convert %>% dplyr::select(rowname, Last)
+#now that I know the exchange rates I will calculate the relevant income and budgets in USA dollars
+IMDB$currency_budget <- IMDB$currency_budget %>% str_replace_all("\\$","USD")
+IMDB$currency_us <- IMDB$currency_us %>% str_replace_all("\\$","USD")
+IMDB$currency <- IMDB$currency %>% str_replace_all("\\$","USD")
+#just have to change the code of the currency to something sensible
+IMDB <-IMDB %>% full_join(Convert, by=c("currency_us"="rowname"))
+IMDB<-IMDB %>% rename(us_exc=Last)
+IMDB <-IMDB %>% full_join(Convert, by=c("currency"="rowname"))
+IMDB<-IMDB %>% rename(glb_exc=Last)
+IMDB <-IMDB %>% full_join(Convert, by=c("currency_budget"="rowname"))
+IMDB<-IMDB %>% rename(bdgt_exc=Last)
+IMDB$gross_budget <- IMDB$bdgt_exc * IMDB$gross_budget
+IMDB$gross_income <- IMDB$glb_exc * IMDB$gross_income
+IMDB$gross_income_us <- IMDB$us_exc * IMDB$gross_income_us
+table(is.na(IMDB$gross_income),is.na(IMDB$gross_income_us))
+IMDB$gross_income<-ifelse(is.na(IMDB$gross_income), IMDB$gross_income_us, IMDB$gross_income)
+table(is.na(IMDB$gross_income), is.na(IMDB$gross_budget))
+#There are several reasons why the income or the budget be missing, if it isn't recorded, it is less mainstream, the calculation of it may be hard etc., as it isn't my goal I will simply drop them, 
+```
+The correlation between income or budget and a dummy for whether the movie is used in the analysis is moderate and significant (income correlation = 0.2467374, p-value = <0.001; budget correlation = 0.3367724, p-value = <0.001), suggesting that there is some selection error involved in this analysis. This results in 12,656 unique movies from various countries and time periods. As the movies' budgets are highly predictive of their income (simple OLS adjusted R2 = 0.5763) instead of income, I use profits as the main outcome variable measuring the success of the movies.
+
+```{r subsetting dataset, include=TRUE, results='hide', fig.show='hide', message=FALSE, warning=FALSE}
+IMDB$in_sample <- !is.na(IMDB$gross_income) & !is.na(IMDB$gross_budget)
+cor.test(as.numeric(IMDB$in_sample), as.numeric(IMDB$gross_income), use = "complete.obs")
+cor.test(as.numeric(IMDB$in_sample), as.numeric(IMDB$gross_budget), use = "complete.obs")
+IMDB <- IMDB %>% filter(!is.na(IMDB$gross_income) & !is.na(IMDB$gross_budget))
+lm(IMDB$gross_income ~ IMDB$gross_budget) %>% summary()
+#removing variables I used for fixing the variables
+IMDB <- IMDB %>% dplyr::select(-bdgt_exc, -us_exc, -glb_exc, -currency_budget, -gross_income_us, -currency_us, -currency, -is_budget, -is_income, -usa_gross_income, -budget, -worlwide_gross_income)
+```
+
+```{r Fixing Variables, include=TRUE, results='hide', fig.show='hide', message=FALSE, warning=FALSE}
+#Fixing variables for the regression
+#Tried creating a dummy matrix from the lists but I don't have the time
+#COUNTRIES
+IMDB$len_country <- sapply(gregexpr("\\,", IMDB$country), length) + 1
+IMDB <- str_split_fixed(IMDB$country, ",", max(IMDB$len_country)) %>% cbind(IMDB,.) %>% data.frame()
+#checking the results 
+str_detect(IMDB$X1, "\\S") %>% table()
+str_detect(IMDB$X2, "\\S") %>% table()
+str_detect(IMDB$X3, "\\S") %>% table()
+# I will only use the first one as the others have too few observations
+IMDB <- IMDB %>% rename(., first_country = X1)
+IMDB <- IMDB %>% dplyr::select(-X2,-X3, -X4,-X5,-X6,-X7,-X8,-X9,-X10,-X11,-X12,-X13,-X14)
+IMDB$first_country <- IMDB$first_country %>% str_replace_all(.,"$^","no_first")
+
+#GENRES
+IMDB$len_g <- sapply(gregexpr("\\,", IMDB$genre), length) + 1
+IMDB <- str_split_fixed(IMDB$genre, ",", max(IMDB$len_g)) %>% cbind(IMDB,.) %>% data.frame()
+#Action, Adventure, Animation, Biography, Comedy, Crime, Documentary, Drama, Family, Fantasy, Film-Noir, History, Horror, Music, Musical, Mystery, Romance, Sci-Fi, Sport, Thriller, War, Western
+IMDB <- IMDB %>% rename(., first_genre = X1, second_genre = X2, third_genre = X3)
+#checking the results 
+str_detect(IMDB$first_genre, "\\S") %>% table()
+str_detect(IMDB$second_genre, "\\S") %>% table()
+str_detect(IMDB$third_genre, "\\S") %>% table()
+# I will include all of these as there is sufficient variation on all three levels
+IMDB$first_genre <- str_trim(IMDB$first_genre, side =  c("both")) 
+IMDB$second_genre <- str_trim(IMDB$second_genre, side =  c("both"))
+IMDB$third_genre <- str_trim(IMDB$third_genre, side =  c("both"))
+IMDB$second_genre <- IMDB$second_genre %>% str_replace_all(.,"$^","no_second") 
+IMDB$third_genre <- IMDB$third_genre %>% str_replace_all(.,"$^","no_third") 
+
+#PRODUCTION COMPANY
+#Later I decided to exclude this as it is nearly unique as there are great many small production companies
+IMDB$production_company %>% table()
+IMDB$production_company <- IMDB$production_company %>% str_replace_all(.,"$^","small_production")
+IMDB$production_company <- ifelse(!duplicated(IMDB$production_company),"small_production", IMDB$production_company)
+IMDB %>% count(production_company) %>% arrange(desc(n))
+#now some of these have commas, but they aren't distinct companies
+M<-IMDB$production_company %>% table() %>% as.data.frame() # quick check of variables some big companies with a lot of small companies
+
+#DESCRIPTION
+#is not used in this case as users can edit the description wikipedia style and are therefore, ex-post in a sense, if the description is assumed accurate then the analysis can be extended to this, however I lack the time for this.
+
+#DURATION
+IMDB$duration %>% table()
+#no missing, looks good
+ggplot() + geom_histogram(aes(IMDB$duration))
+#approximately normally distributed with mean 100
+
+#DATE
+IMDB$date_published<-IMDB$date_published %>% as.Date()
+IMDB$opening_day <- weekdays(IMDB$date_published)
+IMDB$opening_month <- months(IMDB$date_published)
+IMDB %>% count(opening_day) %>% arrange(desc(n))
+IMDB %>% count(opening_month) %>% arrange(desc(n))
+IMDB <- IMDB %>% filter(!is.na(IMDB$opening_day))
+IMDB %>% count(year) %>% arrange(desc(n))
+
+#LANGUAGE
+IMDB$language %>% table()
+IMDB$len_lng <- sapply(gregexpr("\\,", IMDB$language), length) + 1
+IMDB <- str_split_fixed(IMDB$language, ",", max(IMDB$len_lng)) %>% cbind(IMDB,.) %>% data.frame()
+table(IMDB$X1)
+#now there are some films with up to 15 release languages recorded however, the recorded number drops off rather quickly therefore I will only use the first one
+IMDB <- IMDB %>% rename(., first_language = X1)
+IMDB <- IMDB %>% dplyr::select(.,-X2,-X3, -X4, -X5, -X6, -X7, -X8, -X9, -X10, -X11)
+str_detect(IMDB$first_language, "\\S") %>% table()
+IMDB$first_language <- IMDB$first_language %>% str_replace_all(.,"$^","None") 
+#some silent films
+IMDB %>% count(first_language) %>% arrange(desc(n))
+
+#VOTES/NUMBER
+#I decided not to use these, even though they are highly predictive as they are not available pre release and therefore offer no benefit for a pre release decision maker
+IMDB$avg_vote %>% is.na() %>% table
+ggplot() + geom_histogram(aes(IMDB$avg_vote))
+#mean of around 6
+ggplot() + geom_density(aes(IMDB$votes))
+#great many votes, very few with none
+
+#again removing the data wrangling support variables
+IMDB <- IMDB %>% dplyr::select(-len_g, -len_lng, -len_country , -language, -genre, -country, -reviews_from_critics, -reviews_from_users, -metascore, -date_published, -production_company, -in_sample)
+#quick check, no missing all well coded now
+colSums(sapply(IMDB, is.na))
+```
+
+I created a dynamic network from the actors, directors and writers involved in a movie. The basic definition is the same as in the “Kevin Bacon game”: two people are connected if they worked on a movie together. This dynamic approach is necessary so that the actors current experience connectivity is considered. The actors come into existence on their birthday or the first movie they appeared on, and connections are subsequently added as they make movies. No end dates are used for the edges or the nodes; therefore, actors can only gain reputation and incur no reputation loss after death. This, in theory, allows for several centrality measures; however, due to time constraint, I decided to use the simplest, the degree of actors, or simply the number of connections a person has. Other centrality measures such as eigenvector scores, which give larger weight to relationships with better-connected people, are also feasible. However, these are excluded as their inference is very computationally expensive but presents an exciting avenue for future research.
+
+```{r Formating the data for Dynamic Network, include=TRUE, results='hide', message=FALSE, fig.show='hide'}
+#since the whole network is quite large I developed it with just 2019-2020 then extended
+#IMDB <- IMDB %>% filter(.,IMDB$year >= 2018)
+
+#splitting the variables containing the cast to separate columns
+IMDB$len <- sapply(gregexpr("\\,", IMDB$actors), length) + 1
+IMDB <- str_split_fixed(IMDB$actors, ",", max(IMDB$len)) %>% cbind(IMDB,.) %>% data.frame()
+IMDB$dirlen <- sapply(gregexpr("\\,", IMDB$director), length) + 1
+IMDB <- str_split_fixed(IMDB$director, ",", max(IMDB$dirlen)) %>% cbind(IMDB,.) %>% data.frame()
+IMDB$wrilen <- sapply(gregexpr("\\,", IMDB$writer), length) + 1
+IMDB <- str_split_fixed(IMDB$writer, ",", max(IMDB$wrilen)) %>% cbind(IMDB,.) %>% data.frame()
+network <- IMDB %>% dplyr::select(imdb_title_id , X1, X2, X3, X4, X5, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X1.1, X2.1, X1.2, X2.2)
+IMDB <- IMDB %>% dplyr::select( -len,-dirlen, -wrilen,-X1, -X2, -X3, -X4, -X5, -X5, -X6, -X7, -X8, -X9, -X10, -X11, -X12, -X13, -X14, -X15, -X1.1, -X2.1, -X1.2, -X2.2, -writer, -director, -actors)
+#I will need the data in a long format
+network_long <- melt(network, id.vars = "imdb_title_id")
+#adding new names to keep track
+names(network_long) <- c("imdb_title_id","type","actor_name")
+#some are interestingly formated so I will remove spaces around them
+network_long$actor_name <- str_trim(network_long$actor_name, side =  c("both"))
+network_long <- dplyr::select(network_long, imdb_title_id, actor_name)
+str_detect(network_long$actor_name, "\\S") %>% table()
+str_detect(network_long$actor_name, "$^") %>% table()
+# quick check, some missing values as some movies have more or less people involved
+
+
+network_long<- str_detect(network_long$actor_name, "\\S") %>% filter(network_long,.)
+#the edgelist needs to be numbers not names so this bit converts each name to a unique number, note a possible error is actors having the same name, however there isn't really a way to correct for this
+convert_number<-unique(network_long$actor_name) %>% as.data.frame()
+convert_number<-rowid_to_column(convert_number, "id")
+names(convert_number) <-c("number","actor_name")
+network_long<-inner_join(network_long, convert_number, by="actor_name")
+```
+
+```{r Developing the Network, include=TRUE, results='hide', eval=FALSE}
+#I create this network via a simple rule: Those who have worked on a movie together are connected, these connections remain indefinitely, so add up during the actress's career, up until death, when the nodes disappear. Persons life starts at their date of birth, or the first time they appeared on the big screen.
+edges<-full_join(network_long, network_long, by = "imdb_title_id")
+#this creates all possible combinations of the cast for each movie, the base of my network but also a lot of duplicates, such as the duplicates of Actor A - Actress B & Actress B - Actor A or when a person had multiple roles writer & actor and every time
+#These can be safely removed while not losing any connections
+#edges1 <- edges[!duplicated(t(apply(edges,1,sort))),]
+edges <- edges %>% filter(.,edges$number.x != edges$number.y)
+#adding the start of each relationship(when they made a movie together) and the end when either died
+edges <- IMDB %>% dplyr::select(imdb_title_id, year) %>%  inner_join(edges, by="imdb_title_id")
+edges<-rename(edges, onset = year, head = number.x, tail = number.y)
+edges$onset <- edges$onset %>% as.numeric()
+edges <- edges %>% dplyr::select(., -actor_name.x, -actor_name.y) 
+#I use 2021 to check my work 
+edges$terminus <- 2021
+edges$edge_id <- seq_len(nrow(edges))
+edges$duration <- edges$terminus - edges$onset
+table(edges$duration)
+
+#I will also have to create a node list identifying things that are connected
+nodes <- Actors %>% right_join(convert_number, by = c("name"="actor_name"))
+nodes$year_of_birth %>% is.na() %>% table()
+nodes$year_of_death %>% is.na() %>% table()
+table(is.na(nodes$year_of_death),is.na(nodes$year_of_birth))
+nodes$year_of_birth<- nodes$year_of_birth %>% replace(is.na(.),1916) %>% as.numeric()
+#again some are missing so I will define these as the starting from the datasets first year
+nodes$year_of_birth<-ifelse(nodes$year_of_death<1916, 1916, nodes$year_of_birth) %>% as.numeric()
+#everyone nodes, edges are immortal to make sure no decrease in reputation and make understanding easier
+nodes$year_of_death <- 2021
+nodes$year_of_birth<- nodes$year_of_birth %>% replace(is.na(.),1916) %>% as.numeric()
+nodes$duration <- nodes$year_of_death - nodes$year_of_birth
+#this is just tho check my year
+
+#First I defined the year of death as the recorded year of death of the person, however later I reconsidered as it biases the number of connections of those older who's connections die off, however this can create a variety of biases, if for instance one particular group had higher mortality rates, this way I basically track people throughout their career
+#better naming convention
+nodes <- nodes %>% rename( onset = year_of_birth, terminus = year_of_death, vertex.id = number)
+
+#creating a static network to check my results
+edges_st <- edges[,c(3,4)]
+nodes_st <- nodes[,c(20,2,8)]
+tic()
+static_network <- network::network(edges_st, matrix.type = "edgelist", vertex.attr = nodes_st, vertex.attrnames = c("vertex.id", "name", "place_of_birth"), directed  = F, bipartite = F, multiple = F, loops = F)
+toc()
+
+#creating the dynamic network
+edges_dy <- edges[,c(2,5,3,4)]
+nodes_dy <- nodes[,c(18,19,20)]
+tic()
+dynamic_network <- networkDynamic(edge.spells = edges_dy, vertex.spells = nodes_dy)
+toc()
+#it is a 4 Gb network object so this takes significant resources
+#933.67 sec elapsed about 15 minutes
+
+#dynamic_network <- networkDynamic(static_network ,edge.spells = edges_dy, vertex.spells = nodes_dy)
+#if I include the static network it is very slow, or possibly impossible, I made it work once, then saved it wrong and lost it, lesson learned: do not accept the reload from R, talked to the package maintainer however recieved no reply as of now
+
+# network.dynamic.check(dynamic_network)
+#if you run the diagnostic checks you may find that $dyad.check returns a number of FALSE values, this is due to some actors writers being credited after their death
+
+#I looked into several outside network visualisation options however most are impractical with a network of this size
+
+tic()
+degrees2<-tsna::tDegree(dynamic_network)
+toc()
+#3581.57 sec elapsed, about an hour
+#this might take a while to run, so I will format the results and save them for future use
+# this illustrates why I decided not to include other centrality measures, they take too long
+degrees2 <- t(degrees2) %>% as.data.frame()
+degrees2 <- degrees2 %>% rownames_to_column()
+degrees2 <- degrees2 %>% rename(., number  = rowname, `1840` = V1, `1841` = V2, `1842` = V3, `1843` = V4, `1844` = V5, `1845` = V6,`1846` = V7 ,`1847` = V8 ,`1848` = V9 ,`1849` = V10 ,`1850` = V11 ,`1851` = V12 ,`1852` = V13, `1853` = V14,`1854` = V15, `1855` = V16,`1856` = V17 ,`1857` = V18,`1858` = V19,`1859` = V20, `1860` = V21,`1861` = V22,`1862` = V23, `1863` = V24,`1864` = V25, `1865` = V26, `1866` = V27 ,`1867` = V28 ,`1868` = V29,`1869` = V30 ,`1870` = V31,`1871` = V32,`1872` = V33,`1873` = V34,`1874` = V35,`1875` = V36,`1876` = V37,`1877` = V38,`1878` = V39,`1879` = V40,`1880` = V41,`1881` = V42,`1882` = V43,`1883` = V44,`1884` = V45,`1885` = V46,`1886` = V47,`1887` = V48,`1888` = V49,`1889` = V50,`1890` = V51,`1891` = V52,`1892` = V53,`1893` = V54,`1894` = V55,`1895` = V56,`1896` = V57,`1897` = V58,`1898` = V59,`1899` = V60,`1900` = V61,`1901` = V62,`1902` = V63,`1903` = V64,`1904` = V65,`1905` = V66,`1906` = V67,`1907` = V68,`1908` = V69,`1909` = V70,`1910` = V71,`1911` = V72,`1912` = V73,`1913` = V74,`1914` = V75,`1915` = V76,`1916` = V77,`1917` = V78,`1918` = V79,`1919` = V80,`1920` = V81,`1921` = V82,`1922` = V83,`1923` = V84,`1924` = V85,`1925` = V86,`1926` = V87,`1927` = V88,`1928` = V89,`1929` = V90,`1930` = V91,`1931` = V92,`1932` = V93,`1933` = V94,`1934` = V95,`1935` = V96,`1936` = V97,`1937` = V98,`1938` = V99,`1939` = V100,`1940` = V101,`1941` = V102,`1942` = V103,`1943` = V104,`1944` = V105,`1945` = V106,`1946` = V107,`1947` = V108,`1948` = V109,`1949` = V110,`1950` = V111,`1951` = V112,`1952` = V113,`1953` = V114,`1954` = V115,`1955` = V116,`1956` = V117,`1957` = V118,`1958` = V119,`1959` = V120,`1960` = V121,`1961` = V122,`1962` = V123,`1963` = V124,`1964` = V125,`1965` = V126,`1966` = V127,`1967` = V128,`1968` = V129,`1969` = V130,`1970` = V131,`1971` = V132,`1972` = V133,`1973` = V134,`1974` = V135,`1975` = V136,`1976` = V137,`1977` = V138,`1978` = V139, `1979` = V140,`1980` = V141,`1981` = V142,`1982` = V143,`1983` = V144,`1984` = V145,`1985` = V146,`1986` = V147, `1987` = V148,`1988` = V149,`1989` = V150,`1990` = V151,`1991` = V152,`1992` = V153,`1993` = V154,`1994` = V155, `1995` = V156, `1996` = V157, `1997` = V158, `1998` = V159, `1999` = V160, `2000` = V161,`2001` = V162,`2002` = V163,`2003` = V164,`2004` = V165, `2005` = V166,`2006` = V167,`2007` = V168,`2008` = V169,`2009` = V170,`2010` = V171,`2011` = V172,`2012` = V173,`2013` = V174,`2014` = V175,`2015` = V176,`2016` = V177,`2017` = V178,`2018` = V179,`2019` = V180,`2020` = V181,`2021` = V182)
+#innefcient, but couldn't figure out another way
+degrees2$`2021` %>% is.na() %>% table()
+degrees2 <- degrees2 %>% dplyr::select( - `2021`)
+#2021 was only used for safety so I will remove it now
+
+write.csv(degrees2, "~/EC340/degrees.csv", row.names = F)
+
+#This was my attempt to circumvent the dynamic nature of the network to get the centrality measures quicker, this I estimate will take about a day or two on my laptop
+#network_col <-get.networks(dynamic_network, retain.all.vertices = T)
+#degree(static_network)
+#degree_dynamic<-lapply(get.networks(dynamic_network, retain.all.vertices = T),degree)
+#evcent_dynamic<-lapply(network_col,evcent)
+#prestige_dynamic<-lapply(network_col,prestige)
+#betweenness_dynamic<-lapply(network_col,betweenness)
+#closeness_dynamic<-lapply(network_col,closeness)
+#these work however it is not possible which nodes the centrality measures are calculated for, and the splitting takes a long time
+
+#Eigenvectors<-tSnaStats(dynamic_network, "evcent")
+#apparently this supposed to slice the dynamic network then use the sna code to calculate centrality, however it doesn't work in any reasonable timeframe any ways I tried
+```
+
+```{r Formating results, include=TRUE, results='hide', fig.show='hide', message=FALSE, warning=FALSE}
+#Now I will have to assign the centrality measures of degrees to the persons
+degrees2 <- read.csv("~/EC340/degrees.csv", check.names = F)
+#checking if the relode works
+colSums(sapply(degrees2, is.na))
+#formating the network results 
+degrees_melt <- melt(degrees2, id.vars = "number")
+degrees_melt <- degrees_melt %>% unite(., actor_year, number, variable, sep = "_")
+
+#formating the dataset
+network_long_ <- melt(network, id.vars = "imdb_title_id")
+#I will do this so I have the missing values correctly
+names(network_long_) <-c("imdb_title_id","category","actor_name")
+network_long_$category <- network_long_$category %>%  str_remove(., "^X")
+network_long_$actor_name <- str_trim(network_long_$actor_name, side =  c("both"))
+network_long_ <-left_join(network_long_, convert_number, by="actor_name")
+
+str_detect(network_long_$actor_name, "\\S") %>% table()
+str_detect(network_long_$actor_name, "$^") %>% table()
+#checking the cast numbers are correct, out of maximum cast number how many are smaller
+
+#joining the dataset with the results
+degree_res <- network_long_ %>% right_join(dplyr::select(IMDB, year, imdb_title_id), by = "imdb_title_id")
+
+degree_res_missing <- degree_res %>% filter(., is.na(degree_res$number))
+#very good only the missing are missing
+#now I have to reformate it add it back to the dataset
+degree_res <- degree_res %>% unite(., actor_year, number, year, sep = "_")
+degree_results <- degree_res %>% left_join(degrees_melt, by = "actor_year")
+degree_results$value %>% is.na() %>% table()
+degree_results_missing <- degree_results %>% filter(., is.na(degree_results$value))
+degree_results_missing <- degree_results_missing %>% inner_join(Actor_dates, by =c("actor_name"="name"))
+
+#before I am finished with this I will have a look at how the degrees are distributed 
+ggplot() + geom_histogram(aes(degree_results$value))
+ggplot() + geom_density(aes(degree_results$value))
+skimr::skim(degree_results$value)
+#mean of 118, with large standard deviation max : 2294, min : 2
+#most well connected actor according to this is Samuel L. Jackson, Robert De Niro, Nicolas Cage
+
+#reformatting to wide
+degree_results1 <- degree_results %>% dplyr::select(-actor_name, -actor_year)
+degree_results_wide <- degree_results1 %>% spread(key = category, value = value)
+#fixing names
+degree_results_wide <- degree_results_wide %>% rename(`1st_actor` =`1`,`2nd_actor`=`2`,`3rd_actor`=`3`,`4th_actor`=`4`,`5th_actor`=`5`,`6th_actor`=`6`,`7th_actor`=`7`,`8th_actor`=`8`,`9th_actor`=`9`,`10th_actor`=`10`,`11th_actor`=`11`,`12th_actor`=`12`,`13th_actor`=`13`,`14th_actor`=`14`,`15th_actor`=`15`,`1st_director`=`1.1`,`1st_writer`=`1.2`,`2nd_director`=`2.1`,`2nd_writer`=`2.2`,)
+IMDB <- IMDB %>% inner_join(degree_results_wide, by = "imdb_title_id")
+#checking results, as not all films are made with a full cast I recode those to 0  
+colSums(sapply(IMDB, is.na))
+IMDB <- IMDB %>% replace(is.na(.),0)
+
+#checking some relationships
+ggplot( mapping=aes(IMDB$gross_income, IMDB$`1st_writer`)) + geom_point(color = "#1d91c0") + geom_smooth(method = "loess", color = "black") + theme_minimal()
+ggplot( mapping=aes(IMDB$gross_income, IMDB$`1st_actor`)) + geom_point(color = "#1d91c0") + geom_smooth(method = "loess", color = "black") + theme_minimal()
+ggplot( mapping=aes(IMDB$gross_income, IMDB$`1st_director`)) + geom_point(color = "#1d91c0") + geom_smooth(method = "loess", color = "black") + theme_minimal()
+```
+
+```{r intuitive results, include=TRUE, warning=FALSE, results='hide', message=FALSE, fig.align='center', fig.show='asis'}
+#to get some intuition I will create an aggregate cast experience variable 
+IMDB$sum<-IMDB[18:36] %>%  replace(is.na(.),0) %>% rowSums()
+#lm(IMDB$gross_income ~IMDB$sum) %>% summary()
+#lm(IMDB$gross_income ~IMDB$sum + IMDB$gross_budget) %>% summary()
+IMDB$gross_profit <- IMDB$gross_income - IMDB$gross_budget
+#still reasonably predictive of income, however 
+#cor.test(IMDB$sum, IMDB$gross_budget)
+#cor.test(IMDB$sum, IMDB$gross_budget)
+#studios seem to higher more connected casts but gain higher revenues
+
+#This should give some intuition of the relationships between the network results and movie success
+Total_cast_income<-ggplot( mapping=aes(IMDB$gross_income, IMDB$sum)) + geom_point(color = "#5b3069") + geom_smooth(method = "loess", color = "black") + xlab("Movie Gross Income") + ylab("Total Cast Experience") + theme_minimal() 
+Total_cast_profit<-ggplot( mapping=aes(IMDB$gross_profit, IMDB$sum)) + geom_point(color = "#5b3069") + geom_smooth(method = "loess", color = "black") + xlab("Movie Gross Profit") + ylab("Total Cast Experience") + theme_minimal() 
+
+CastExp<-ggarrange(Total_cast_income, Total_cast_profit, ncol = 2, nrow = 1)
+CastExp<- annotate_figure(CastExp, top = text_grob("Total Cast Experience vs. Gross Income & Gross Profit", size = 15))
+ggsave("~/EC340/CastExp.png",plot = CastExp,dpi = 700, width =9, height = 6)
+CastExp
+```
+<div align="center"> *Figure 1.* </div>
+
+The centrality measures from the dynamic network are clearly positively related to movie performance. This can be seen by plotting the aggregate cast connection score against profits and income Figure 1. This is not surprising as degree scores, in this case, measure the experience and the connectedness of the cast, two factors clearly crucial in movie production or deciding what to watch on Friday night. The relationship is more complex for profits; however, both show decreasing returns for cast experience. I would argue that connectedness is a better measure of cast experience, skill, notoriety than the simple number of movies people worked on or previous movie revenues used in for instance (Wallace, Siegerman, and Holbrook, 1996).
+
+## Methodology
+
+Several linear algorithms are used in this paper to ensure robustness and improve prediction performance maximisation. The models used are OLS, Ridge, LASSO, Adaptive LASSO, Elastic Net, and Adaptive Elastic Net. Additionally, Random Forest is used as a non-linear regression tree-based algorithm. The methods use several parameters as inputs in fitting the models. To optimise these hyper parameters, 10-fold cross-validation is used for each method. Where 9/10 of the data is used for fitting the models and 1/10 for evaluating the performance of the parameters, parameters selected are the ones minimising the mean squared error.
+
+For the analysis, the data is randomly split so that 75% of the observations are used for training the models, and 25% of the movies are used to assess the generalisability of the models. The evaluation is done by two key measures residual means squared errors (RMSE), measuring the standard error of residuals and mean average error (MAE), measuring the average of the residuals to understand the generalisability of the models.
+
+
+$$
+RMSE=\sqrt{\frac{\sum_{i=1}^{N}{(Predicted_i-Actual_i)^2}}{N}};MAE=\sqrt{\frac{\sum_{i=1}^{N}{|Predicted_i-Actual_i|}}{N}}
+$$
+The model selected then is further explored to understand the importance of cast experience on the success of the films. In this case, the selected model is the Random Forest and is further analysed using variable importance plots, specifically two measures: Mean Decrease in Accuracy, which measures the loss in accuracy if the variable is excluded from the model and, Mean Decrease in Gini coefficient, measuring how much each variable contributes to the homogeneity of nodes and leaves in the model.
+
+## Modelling Results
+
+The model selection, as described in the methodology section, has two main measures. RMSE is the more important one as it presents a larger penalty for larger errors. MAE is also essential as it is more intuitive and more robust against outliers. Results for both are present in Figure 2.
+
+```{r ANALYSIS, include=TRUE, warning=FALSE, message=FALSE, results='hide'}
+#ANALYSIS
+#easier analysis I wrote a dataset after the datawrangling for easier work
+#write.csv(IMDB, "~/EC340/IMDB_analysis.csv", row.names = F)
+IMDB <- read.csv("~/EC340/IMDB_analysis.csv", check.names = F)
+IMDB$gross_profit <- IMDB$gross_income - IMDB$gross_budget
+#I will use profit as budget is highly predictive of income 
+IMDB_1 <- IMDB %>% dplyr::select(-imdb_title_id ,-title, -actors, -director, -writer, -original_title, -description, -votes, -avg_vote, -sum, -gross_budget, -gross_income)
+#creating 0/1 dummies from factors
+IMDB_1<-model.matrix(~ ., data=IMDB_1, contrasts.arg = sapply(IMDB_1[,c(1,3:9)], as.factor)) %>% as.data.frame()
+NZV<-nearZeroVar(IMDB_1, saveMetrics = T)
+IMDB_1 <- IMDB_1[,-nearZeroVar(IMDB_1)]
+#splitting the dataset into a training and test sample
+sample_size <- floor(0.75 * nrow(IMDB_1))
+train_indicator <- sample(seq_len(nrow(IMDB_1)), size = sample_size)
+train1 <- IMDB_1[train_indicator,]
+test1 <- IMDB_1[-train_indicator,]
+train1_x <- train1 %>% dplyr::select(-gross_profit)
+train1_y <- train1 %>% dplyr::select( gross_profit)
+test1_x <- test1 %>% dplyr::select(-gross_profit)
+test1_y <- test1 %>% dplyr::select( gross_profit)
+
+#the regularisation methods like inputs as matrix objects
+train1_x_m <- train1_x %>% data.matrix()
+test1_x_m <- test1_x %>% data.matrix()
+
+#Fitting the models
+#OLS
+OLS1 <-lm(train1_y$gross_profit ~ ., train1_x)
+OLS1_prediction_train <- predict(OLS1, train1_x)
+
+#saving the performance metrics
+OLS_RMSE_train<-RMSE(OLS1_prediction_train, train1_y$gross_profit)
+OLS_MAE_train<-MAE(OLS1_prediction_train, train1_y$gross_profit) 
+OLS1_prediction_test <- predict(OLS1, test1_x)
+OLS_RMSE_test<-RMSE(OLS1_prediction_test, test1_y$gross_profit)
+OLS_MAE_test<-MAE(OLS1_prediction_test, test1_y$gross_profit)
+
+#RIDGE
+Ridge1 <-cv.glmnet(train1_x_m, train1_y$gross_profit, alpha=0 , nfolds = 10, standardize = T)
+
+#saving the performance metrics
+Ridge1_prediction_train <- predict(Ridge1, train1_x_m)
+Ridge_RMSE_train<-RMSE(Ridge1_prediction_train, train1_y$gross_profit)
+Ridge_MAE_train<-MAE(Ridge1_prediction_train, train1_y$gross_profit)
+Ridge1_prediction_test <- predict(Ridge1, test1_x_m)
+Ridge_RMSE_test<-RMSE(Ridge1_prediction_test, test1_y$gross_profit)
+Ridge_MAE_test<-MAE(Ridge1_prediction_test, test1_y$gross_profit)
+
+#LASSO
+Lasso1 <- cv.glmnet(train1_x_m, train1_y$gross_profit, nfolds = 10, standardize = T)
+m<-extract.coef(Ridge1)
+
+#saving the performance metrics
+Lasso1_prediction_train <- predict(Lasso1, train1_x_m)
+Lasso_RMSE_train<-RMSE(Lasso1_prediction_train, train1_y$gross_profit)
+Lasso_MAE_train<-MAE(Lasso1_prediction_train, train1_y$gross_profit)
+Lasso1_prediction_test <- predict(Lasso1, test1_x_m)
+Lasso_RMSE_test<-RMSE(Lasso1_prediction_test, test1_y$gross_profit)
+Lasso_MAE_test<-MAE(Lasso1_prediction_test, test1_y$gross_profit)
+
+#ADAPTIVE LASSO
+  omega1 <- abs(coef(Lasso1))
+  omega1 <- 1/omega1
+  omega1[omega1==Inf] <- 99999
+  
+Adalasso1 <- cv.glmnet(train1_x_m, train1_y$gross_profit,penalty.factor=omega1, nfolds = 10, standardize = T)
+
+#saving the performance metrics
+Adalasso1_prediction_train <- predict(Adalasso1, train1_x_m)
+Adalasso_RMSE_train<-RMSE(Adalasso1_prediction_train, train1_y$gross_profit)
+Adalasso_MAE_train<-MAE(Adalasso1_prediction_train, train1_y$gross_profit)
+Adalasso1_prediction_test <- predict(Adalasso1, test1_x_m)
+Adalasso_RMSE_test<-RMSE(Adalasso1_prediction_test, test1_y$gross_profit)
+Adalasso_MAE_test<-MAE(Adalasso1_prediction_test, test1_y$gross_profit)
+
+#ELASTIC NET
+#since glmnet does not perform cross validation of the alpha parameter carot package is used to train the elastic net
+cv_10 <- trainControl(method = "cv", number = 10)
+Elnet_tune<- caret::train(train1_y$gross_profit, x= train1_x_m,  method = "glmnet",  trControl = cv_10, tuneLength =10, standardize = T)
+
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+
+Elnet_tune_lambda<-get_best_result(Elnet_tune)$lambda
+Elnet_tune_alpha<-get_best_result(Elnet_tune)$alpha
+Elnet1 <- glmnet(train1_x_m, train1_y$gross_profit, standardize = T,alpha = Elnet_tune_alpha, lambda = Elnet_tune_lambda)
+
+#saving the performance metrics
+Elnet1_prediction_train <- predict(Elnet1, train1_x_m)
+Elnet_RMSE_train<-RMSE(Elnet1_prediction_train, train1_y$gross_profit)
+Elnet_MAE_train<-MAE(Elnet1_prediction_train, train1_y$gross_profit)
+Elnet1_prediction_test <- predict(Elnet1, test1_x_m)
+Elnet_RMSE_test<-RMSE(Elnet1_prediction_test, test1_y$gross_profit)
+Elnet_MAE_test<-MAE(Elnet1_prediction_test, test1_y$gross_profit)
+  
+#ADAPTIVE ELASTIC NET
+  omega2 <- abs(coef(Elnet1))
+  omega2 <- 1/omega2
+  omega2[omega2==Inf] <- 99999
+AdaElnet1 <-cv.glmnet(train1_x_m, train1_y$gross_profit, standardize = T, nfolds = 10, penalty.factor = omega2,alpha = Elnet_tune_alpha)
+
+#saving the performance metrics
+AdaElnet1_prediction_train <- predict(AdaElnet1, train1_x_m)
+AdaElnet_RMSE_train<-RMSE(AdaElnet1_prediction_train, train1_y$gross_profit)
+AdaElnet_MAE_train<-MAE(AdaElnet1_prediction_train, train1_y$gross_profit)
+AdaElnet1_prediction_test <- predict(AdaElnet1, test1_x_m)
+AdaElnet_RMSE_test<-RMSE(AdaElnet1_prediction_test, test1_y$gross_profit)
+AdaElnet_MAE_test<-MAE(AdaElnet1_prediction_test, test1_y$gross_profit)
+
+#RANDOM FORREST
+#again hyperparameter tuning is done via caret 
+#Manual searching hyperparameters by creating 10 folds and repeating 3 times
+control <- trainControl(method = 'repeatedcv',
+                        number = 10,
+                        repeats = 3,
+                        search = 'grid')
+#creating the tuning grid
+tunegrid <- expand.grid(.mtry = c(sqrt(ncol(train1_x))))
+modellist <- list()
+
+tic()
+#for some reason caret prefers outcome and explanatory in the same dataframe
+train1_x$gross_profit <- train1_y$gross_profit
+#train with different ntree parameters#
+#FOR PRESENTATION I DISABLEDS THIS VALIDATION AS IT TAKES ABOUT 3 HOURS to run on my laptop, but works fine if `#` are removed
+#for (ntree in c(50,100,200,1000,2000)){
+#  fit <- train(gross_profit ~ .,
+#               data = train1_x,
+#               preProcess = c("center","scale"),
+#               method = 'rf',
+#               metric = 'RMSE',
+#               tuneGrid = tunegrid,
+#               trControl = control,
+#               ntree = ntree
+#               )
+#  key <- toString(ntree)
+#  modellist[[key]] <- fit
+#}
+
+#results <- resamples(modellist)
+#summary(results)
+#1000 runs seem to be the most efficient based on RMSE
+toc()
+#11816.86 sec elapsed or about 3 and a half hours
+
+
+tic()
+#random forest doesn't like the names I used so far, so cheap and easy replace them
+colnames(test1_x)<-make.names(colnames(test1_x))
+colnames(train1_x)<-make.names(colnames(train1_x))
+RForrest1 <- randomForest(train1_y$gross_profit ~ ., train1_x ,standardize = T,importance=TRUE,ntree=1000)
+toc()
+
+#saving the performance metrics
+RForrest1_prediction_train <- predict(RForrest1, train1_x)
+RForrest_RMSE_train<-RMSE(RForrest1_prediction_train, train1_y$gross_profit)
+RForrest_MAE_train<-MAE(RForrest1_prediction_train, train1_y$gross_profit)
+RForrest1_prediction_test <- predict(RForrest1, test1_x)
+RForrest_RMSE_test<-RMSE(RForrest1_prediction_test, test1_y$gross_profit)
+RForrest_MAE_test<-MAE(RForrest1_prediction_test, test1_y$gross_profit)
+```
+
+```{r Model performance, include=TRUE, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.show='asis'}
+#gonna see which model performs best, I have a nudge it will be the Random Forest, based on the data I have seen so far
+result <- c(OLS_RMSE_test,OLS_MAE_test,Ridge_RMSE_test,Ridge_MAE_test,Lasso_RMSE_test,Lasso_MAE_test,Adalasso_RMSE_test,Adalasso_MAE_test,Elnet_RMSE_test,Elnet_MAE_test,AdaElnet_RMSE_test,AdaElnet_MAE_test,RForrest_RMSE_test,RForrest_MAE_test)
+eval <- c("OLS RMSE","OLS MAE","Ridge RMSE ","Ridge MAE ","LASSO RMSE ","LASSO MAE","Adaptive LASSO RMSE","Adaptive LASSO MAE","Elastic Net RMSE","Elastic Net MAE","Adaptive Elastic Net RMSE","Adaptive Elastic Net MAE","Random Forest RMSE","Random Forest MAE")
+EVAL <- data.frame(eval, result)
+#indeed the random forest performs best based on RMSE & MAE
+
+#Creating a plot of performance measures
+EVAL$measure <- c("RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE")
+model_eval<-ggplot() + geom_bar(aes(EVAL$eval, EVAL$result, fill =EVAL$measure), stat = "identity") + xlab("Test scores") + ylab("Modelling method") + coord_flip() + scale_fill_manual(values = c("#5c326b","#94749c")) + theme_minimal() 
+model_eval<-model_eval+ theme(legend.position = "none") + ggtitle("Model Prediction Performance")
+ggsave("~/EC340/model_eval.png",plot = model_eval,dpi = 700, width =14, height = 10)
+model_eval
+```
+<div align="center"> *Figure 2.* </div>
+
+Based on Figure 2, the Random Forest provides the best performance amongst models considered, for both RMSE and MAE, outperforming all linear penalised, adaptive, and standard OLS models. This is not surprising, seeing the nonlinearities and spread in the data from Figure 1. This is different from the results from the (Lash & Zhao, 2016), who find the LASSO to fit best, result for two reasons. The number of observations is significantly larger than in (Lash & Zhao, 2016) of around 2500 movies and possibly more balanced. Furthermore, I did not include different construction of variables that would induce multicollinearity.
+
+```{r Random Forest VarImp,include=TRUE, warning=FALSE, results='hide',fig.show='hide'}
+#to further assess the results I will use a variable importance plot
+#varImpPlot(RForrest1)
+#gonna clean up the variable importance plot a bit, presentation is everything
+RFplot<-varImpPlot(RForrest1) %>% as.data.frame()
+```
+```{r Random Forest Results ,include=TRUE, warning=FALSE, results='hide', fig.align='center',fig.show='asis'}
+RFplot$varnames <- rownames(RFplot)
+RFplot$varnames <-c("Release Year" ,"Duration of movie","Country : France","Country : UK","Country : USA","first genre : Adventure","first genre : Biography","first genre : Comedy","first genre : Crime", "first genre : Drama", "second genre : Adventure", "second genre : Comedy", "second genre : Crime", "second genre : Drama", "second genre : No second", "second genre : Romance", "third genre : Drama", "third genre : No third", "third genre : Romance", "third genre : Thriller", "opening on Thursday", "opening on Wednesday", "opening in August", "opening in December", "opening in February", "opening in January", "opening in July", "opening in June", "opening in March", "opening in May", "opening in November", "opening in October", "opening in September", "English", "1st Actor.", "1st Director.", "1st Writer.", "10th Actor.", "11th Actor.", "12th Actor.", "13th Actor.", "14th Actor.", "15th Actor.", "2nd Actor.", "2nd Writer.", "3rd Actor.", "4th Actor.", "5th Actor.", "6th Actor.", "7th Actor.", "8th Actor.", "9th Actor.")
+
+RFplot1 <- RFplot %>% dplyr::filter(`%IncMSE` >1.67870062)
+plot1<-ggplot(RFplot1, aes(x=reorder(varnames, `%IncMSE`), y=`%IncMSE`))  + geom_point(color = "#94749c", size = 4) + geom_segment(aes(x=varnames,xend=varnames,y=0,yend=`%IncMSE`), color = "#94749c", size = 1.5) + ylab("Mean Decrease in Accuracy") + xlab("Variable") + coord_flip() + theme_minimal()
+
+RFplot2 <- RFplot %>% dplyr::filter(IncNodePurity >3.190613e+17)
+plot2<-ggplot(RFplot2, aes(x=reorder(varnames, IncNodePurity), y=IncNodePurity)) + geom_point(color = "#94749c", size = 4) + geom_segment(aes(x=varnames,xend=varnames,y=0,yend=IncNodePurity), color = "#94749c", size = 1.5) + ylab("Mean Decrease in Gini") + xlab("Variable") + coord_flip() + theme_minimal()
+
+VariableImportancePlot<-ggarrange( plot1 , plot2, ncol = 2, nrow = 1)
+VariableImportancePlot<-annotate_figure(VariableImportancePlot, top = text_grob("Variable Importance Plots", size = 15))
+ggsave("~/EC340/VariableImportancePlot.png",plot = VariableImportancePlot,dpi = 700, width =14, height = 10)
+VariableImportancePlot
+```
+<div align="center"> *Figure 3.* </div>
+                                                                         
+To further explore the relationships in the chosen model, variable importance plots are presented in Figure 3. 1st Director's number of connections as well as other cast members connections are important to predicting the movie success in this case. The results, I argue, are intuitive as a possible mechanism could be that directors and the main actors are the first to be involved in production. Therefore, they can shape the movie throughout production; a higher number of connections and experience of these cast members will determine whether they can find financing, ideas, other cast members to realise their vision. These results are also robust to using Gross Income as outcome variable.
+
+## Conclusion
+
+This paper presented the case for including dynamic network of cast members to improve pre-release prediction of movie revenue. I find a strong relationship between the number of connections of the movie team and its performance in terms of profit and income. The result presents a viable and interesting alternative methodology to the popular sentiment analysis approach but one that allows for pre-release and post-release prediction. Further analysis could explore the mechanisms behind the results presented here by including additional network and non-network variables, gaining a better understanding of the network dynamics and their efficiency.
+
+```{r Income as outcome, include=FALSE, echo=TRUE, warning=FALSE, results='hide', eval=FALSE}
+#I also checked the income case, the code is identical other than the outcome variables,the outcome is similar
+#write.csv(IMDB, "~/EC340/IMDB_analysis.csv", row.names = F)
+IMDB <- read.csv("~/EC340/IMDB_analysis.csv", check.names = F)
+IMDB$gross_income 
+
+IMDB_1 <- IMDB %>% dplyr::select(-imdb_title_id ,-title, -actors, -director, -writer, -original_title, -description, -votes, -avg_vote, -sum, -gross_profit)
+
+IMDB_1<-model.matrix(~ ., data=IMDB_1, contrasts.arg = sapply(IMDB_1[,c(1,3:9)], as.factor)) %>% as.data.frame()
+NZV<-nearZeroVar(IMDB_1, saveMetrics = T)
+IMDB_1 <- IMDB_1[,-nearZeroVar(IMDB_1)]
+
+sample_size <- floor(0.75 * nrow(IMDB_1))
+train_indicator <- sample(seq_len(nrow(IMDB_1)), size = sample_size)
+
+train1 <- IMDB_1[train_indicator,]
+test1 <- IMDB_1[-train_indicator,]
+
+train1_x <- train1 %>% dplyr::select(-gross_profit)
+train1_y <- train1 %>% dplyr::select( gross_profit)
+test1_x <- test1 %>% dplyr::select(-gross_profit)
+test1_y <- test1 %>% dplyr::select( gross_profit)
+#the regularisation methods like inputs as matrix objects
+train1_x_m <- train1_x %>% data.matrix()
+test1_x_m <- test1_x %>% data.matrix()
+
+#Fitting the models
+#OLS
+OLS1 <-lm(train1_y$gross_income ~ ., train1_x)
+OLS1_prediction_train <- predict(OLS1, train1_x)
+
+OLS_RMSE_train<-RMSE(OLS1_prediction_train, train1_y$gross_income)
+OLS_MAE_train<-MAE(OLS1_prediction_train, train1_y$gross_income) 
+
+OLS1_prediction_test <- predict(OLS1, test1_x)
+OLS_RMSE_test<-RMSE(OLS1_prediction_test, test1_y$gross_income)
+OLS_MAE_test<-MAE(OLS1_prediction_test, test1_y$gross_income)
+
+#RIDGE
+Ridge1 <-cv.glmnet(train1_x_m, train1_y$gross_income, alpha=0 , nfolds = 10, standardize = T)
+
+Ridge1_prediction_train <- predict(Ridge1, train1_x_m)
+Ridge_RMSE_train<-RMSE(Ridge1_prediction_train, train1_y$gross_income)
+Ridge_MAE_train<-MAE(Ridge1_prediction_train, train1_y$gross_income)
+
+Ridge1_prediction_test <- predict(Ridge1, test1_x_m)
+Ridge_RMSE_test<-RMSE(Ridge1_prediction_test, test1_y$gross_income)
+Ridge_MAE_test<-MAE(Ridge1_prediction_test, test1_y$gross_income)
+
+#LASSO
+Lasso1 <- cv.glmnet(train1_x_m, train1_y$gross_income, nfolds = 10, standardize = T)
+m<-extract.coef(Ridge1)
+
+Lasso1_prediction_train <- predict(Lasso1, train1_x_m)
+Lasso_RMSE_train<-RMSE(Lasso1_prediction_train, train1_y$gross_income)
+Lasso_MAE_train<-MAE(Lasso1_prediction_train, train1_y$gross_income)
+
+Lasso1_prediction_test <- predict(Lasso1, test1_x_m)
+Lasso_RMSE_test<-RMSE(Lasso1_prediction_test, test1_y$gross_income)
+Lasso_MAE_test<-MAE(Lasso1_prediction_test, test1_y$gross_income)
+
+#ADAPTIVE LASSO
+  omega1 <- abs(coef(Lasso1))
+  omega1 <- 1/omega1
+  omega1[omega1==Inf] <- 99999
+  Adalasso1 <- cv.glmnet(train1_x_m, train1_y$gross_income,penalty.factor=omega1, nfolds = 10, standardize = T)
+  
+Adalasso1_prediction_train <- predict(Adalasso1, train1_x_m)
+Adalasso_RMSE_train<-RMSE(Adalasso1_prediction_train, train1_y$gross_income)
+Adalasso_MAE_train<-MAE(Adalasso1_prediction_train, train1_y$gross_income)
+
+Adalasso1_prediction_test <- predict(Adalasso1, test1_x_m)
+Adalasso_RMSE_test<-RMSE(Adalasso1_prediction_test, test1_y$gross_income)
+Adalasso_MAE_test<-MAE(Adalasso1_prediction_test, test1_y$gross_income)
+
+#ELASTIC NET
+#since glmnet does not perform cross validation of the alpha parameter carot package is used to train the elastic net
+cv_10 <- trainControl(method = "cv", number = 10)
+Elnet_tune<- caret::train(train1_y$gross_income, x= train1_x_m,  method = "glmnet",  trControl = cv_10, tuneLength =10, standardize = T)
+
+Elnet_tune_lambda<-get_best_result(Elnet_tune)$lambda
+Elnet_tune_alpha<-get_best_result(Elnet_tune)$alpha
+Elnet1 <- glmnet(train1_x_m, train1_y$gross_income, standardize = T,alpha = Elnet_tune_alpha, lambda = Elnet_tune_lambda)
+
+
+Elnet1_prediction_train <- predict(Elnet1, train1_x_m)
+Elnet_RMSE_train<-RMSE(Elnet1_prediction_train, train1_y$gross_income)
+Elnet_MAE_train<-MAE(Elnet1_prediction_train, train1_y$gross_income)
+
+Elnet1_prediction_test <- predict(Elnet1, test1_x_m)
+Elnet_RMSE_test<-RMSE(Elnet1_prediction_test, test1_y$gross_income)
+Elnet_MAE_test<-MAE(Elnet1_prediction_test, test1_y$gross_income)
+  
+#ADAPTIVE ELASTIC NET
+  omega2 <- abs(coef(Elnet1))
+  omega2 <- 1/omega2
+  omega2[omega2==Inf] <- 99999
+  AdaElnet1 <-cv.glmnet(train1_x_m, train1_y$gross_income, standardize = T, nfolds = 10, penalty.factor = omega2,alpha = Elnet_tune_alpha)
+  
+AdaElnet1_prediction_train <- predict(AdaElnet1, train1_x_m)
+AdaElnet_RMSE_train<-RMSE(AdaElnet1_prediction_train, train1_y$gross_income)
+AdaElnet_MAE_train<-MAE(AdaElnet1_prediction_train, train1_y$gross_income)
+
+AdaElnet1_prediction_test <- predict(AdaElnet1, test1_x_m)
+AdaElnet_RMSE_test<-RMSE(AdaElnet1_prediction_test, test1_y$gross_income)
+AdaElnet_MAE_test<-MAE(AdaElnet1_prediction_test, test1_y$gross_income)
+
+
+#RANDOM FORREST
+
+#Manual searching hyperparameters by creating 10 folds and repeating 3 times
+control <- trainControl(method = 'repeatedcv',
+                        number = 10,
+                        repeats = 3,
+                        search = 'grid')
+#creating the tuning grid
+tunegrid <- expand.grid(.mtry = c(sqrt(ncol(train1_x))))
+modellist <- list()
+
+tic()
+#for some reason caret prefers outcome and explanatory in the same dataframe
+train1_x$gross_income <- train1_y$gross_income
+#train with different ntree parameters
+for (ntree in c(50,100,200,1000,2000)){
+  fit <- train(gross_profit ~ .,
+               data = train1_x,
+               preProcess = c("center","scale"),
+               method = 'rf',
+               metric = 'RMSE',
+               tuneGrid = tunegrid,
+               trControl = control,
+               ntree = ntree
+               )
+  key <- toString(ntree)
+  modellist[[key]] <- fit
+}
+
+results <- resamples(modellist)
+summary(results)
+#1000 runs seem to be the most efficient based on RMSE
+
+toc()
+#11816.86 sec elapsed or about 3 and a half hours
+
+
+tic()
+#random forest doesn't like the names I used so far, so cheap and easy replace them
+colnames(test1_x)<-make.names(colnames(test1_x))
+colnames(train1_x)<-make.names(colnames(train1_x))
+RForrest1 <- randomForest(train1_y$gross_income ~ ., train1_x ,standardize = T,importance=TRUE,ntree=1000)
+toc()
+
+RForrest1_prediction_train <- predict(RForrest1, train1_x)
+RForrest_RMSE_train<-RMSE(RForrest1_prediction_train, train1_y$gross_income)
+RForrest_MAE_train<-MAE(RForrest1_prediction_train, train1_y$gross_income)
+
+RForrest1_prediction_test <- predict(RForrest1, test1_x)
+RForrest_RMSE_test<-RMSE(RForrest1_prediction_test, test1_y$gross_income)
+RForrest_MAE_test<-MAE(RForrest1_prediction_test, test1_y$gross_income)
+
+varImpPlot(RForrest1)
+#gonna clean up the variable importance plot a bit, presentation is everything
+RFplot<-varImpPlot(RForrest1) %>% as.data.frame()
+RFplot$varnames <- rownames(RFplot)
+RFplot$varnames <-c("Release Year" ,"Duration of movie","Gross Budget","Country : France","Country : UK","Country : USA","first genre : Adventure","first genre : Biography","first genre : Comedy","first genre : Crime", "first genre : Drama", "second genre : Adventure", "second genre : Comedy", "second genre : Crime", "second genre : Drama", "second genre : No second", "second genre : Romance", "third genre : Drama", "third genre : No third", "third genre : Romance", "third genre : Thriller", "opening on Thursday", "opening on Wednesday", "opening in August", "opening in December", "opening in February", "opening in January", "opening in July", "opening in June", "opening in March", "opening in May", "opening in November", "opening in October", "opening in September", "English", "1st Actor.", "1st Director.", "1st Writer.", "10th Actor.", "11th Actor.", "12th Actor.", "13th Actor.", "14th Actor.", "15th Actor.", "2nd Actor.", "2nd Writer.", "3rd Actor.", "4th Actor.", "5th Actor.", "6th Actor.", "7th Actor.", "8th Actor.", "9th Actor.")
+RFplot1 <- RFplot %>% dplyr::filter(`%IncMSE` >1.67870062)
+plot1<-ggplot(RFplot1, aes(x=reorder(varnames, `%IncMSE`), y=`%IncMSE`))  + geom_point(color = "#94749c", size = 4) + geom_segment(aes(x=varnames,xend=varnames,y=0,yend=`%IncMSE`), color = "#94749c", size = 1.5) + ylab("Mean Decrease in Accuracy") + xlab("Variable") + coord_flip() + theme_minimal()
+
+RFplot2 <- RFplot %>% dplyr::filter(IncNodePurity >3.190613e+17)
+plot2<-ggplot(RFplot2, aes(x=reorder(varnames, IncNodePurity), y=IncNodePurity)) + geom_point(color = "#94749c", size = 4) + geom_segment(aes(x=varnames,xend=varnames,y=0,yend=IncNodePurity), color = "#94749c", size = 1.5) + ylab("Mean Decrease in Gini") + xlab("Variable") + coord_flip() + theme_minimal()
+
+VariableImportancePlot<-ggarrange( plot1 , plot2, ncol = 2, nrow = 1)
+VariableImportancePlot<-annotate_figure(VariableImportancePlot, top = text_grob("Variable Importance Plots using Movie Gross Income", size = 15))
+
+ggsave("~/EC340/VariableImportancePlotIncome.png",plot = VariableImportancePlot,dpi = 700, width =14, height = 10)
+
+
+
+#gonna see which model performs best, I have a nudge it will be the Random Forest
+result <- c(OLS_RMSE_test,OLS_MAE_test,Ridge_RMSE_test,Ridge_MAE_test,Lasso_RMSE_test,Lasso_MAE_test,Adalasso_RMSE_test,Adalasso_MAE_test,Elnet_RMSE_test,Elnet_MAE_test,AdaElnet_RMSE_test,AdaElnet_MAE_test,RForrest_RMSE_test,RForrest_MAE_test)
+
+eval <- c("OLS RMSE","OLS MAE","Ridge RMSE ","Ridge MAE ","LASSO RMSE ","LASSO MAE","Adaptive LASSO RMSE","Adaptive LASSO MAE","Elastic Net RMSE","Elastic Net MAE","Adaptive Elastic Net RMSE","Adaptive Elastic Net MAE","Random Forest RMSE","Random Forest MAE")
+
+EVAL <- data.frame(eval, result)
+#indeed the random forest performs best based on RMSE & MAE
+
+#gonna create a plot of that
+EVAL$measure <- c("RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE","RMSE","MAE")
+model_eval<-ggplot() + geom_bar(aes(EVAL$eval, EVAL$result, fill =EVAL$measure), stat = "identity") + xlab("Test scores") + ylab("Modelling method") + coord_flip() + scale_fill_manual(values = c("#5c326b","#94749c")) + theme_minimal() 
+model_eval<-model_eval+ theme(legend.position = "none") + ggtitle("Model Prediction Performance with Income")
+ggsave("~/EC340/model_eval_income.png",plot = model_eval,dpi = 700, width =14, height = 10)
+toc()
+```
+
+## References
+
+Ahmad, I.S., Bakar, A.A., Yaakub, M.R. and Muhammad, S.H., 2020. A survey on machine learning techniques in movie revenue prediction. SN Computer Science, 1(4), pp.1-14.
+
+Bae, G. and Kim, H.J., 2019. The impact of movie titles on box office success. Journal of Business Research, 103, pp.100-109.
+
+Bhave, A., Kulkarni, H., Biramane, V. and Kosamkar, P., 2015, January. Role of different factors in predicting movie success. In 2015 International Conference on Pervasive Computing (ICPC) (pp. 1-4). IEEE.
+
+Collins, J.J. and Chow, C.C., 1998. It's a small world. Nature, 393(6684), pp.409-410.
+
+Flora, B., Lampo, T. and Yang, L., 2015. Predicting Movie Revenue from Pre-Release Data. CS229, Stanford University.
+
+Hopkins, B., 2004. Kevin Bacon and graph theory. Problems, Resources, and Issues in Mathematics Undergraduate Studies, 14(1), pp.5-11.
+
+Lash, Michael T., and Kang Zhao. "Early predictions of movie success: The who, what, and when of profitability." Journal of Management Information Systems 33, no. 3 (2016): 874-903.
+
+Lee, K., Park, J., Kim, I. and Choi, Y., 2018. Predicting movie success with machine learning techniques: ways to improve accuracy. Information Systems Frontiers, 20(3), pp.577-588.
+
+Leone, S., 2020. IMDb movies extensive dataset. [online] Available at: <https://www.kaggle.com/stefanoleone992/imdb-extensive-dataset> [Accessed 18 May 2021].
+
+Wallace, W.T., Seigerman, A. and Holbrook, M.B., 1993. The role of actors and actresses in the success of films: How much is a movie star worth?. Journal of cultural economics, 17(1), pp.1-27.
+
+## Packages Used
+
+Bender-deMoll, S., and Morris, M., 2020. tsna: Tools for Temporal Social Network Analysis. R package version 0.3.1.
+
+Butts, C., 2020a. network:Classes for Relational Data_.The Statnet Project (<URL:http://www.statnet.org>). Rpackage version 1.16.1
+
+Butts, C., 2020b. sna: Tools for Social Network Analysis. R package version 2.6.
+
+Butts, C., Leslie-Cook, A., Krivitsky, P., N., and Bender-deMoll, S., 2020. networkDynamic: Dynamic Extensions for Network Objects. R package version 0.10.1. 
+
+Chernozhukov, V., Hansen, C., and Spindler, M., 2016. hdm: High-Dimensional Metrics R Journal, 8(2), 185-199. 
+
+Friedman, J., Hastie, T., and Tibshirani, R., 2010. Regularization Paths for Generalized Linear Models via Coordinate Descent. Journal of Statistical Software, 33(1), 1-22. URL https://www.jstatsoft.org/v33/i01/.
+
+Henry, L., and Wickham, H., 2020. rlang: Functions for Base Types and Core R and 'Tidyverse' Features. R package version 0.4.10
+
+Izrailev, S., 2021. tictoc: Functions for Timing R Scripts, as Well as Implementations of Stack and List Structures. Rpackage version 1.0.1. 
+
+Kassambara, A., 2020. ggpubr: 'ggplot2' Based Publication Ready Plots. R package version 0.4.0.
+
+Kuhn, M., 2020. caret: Classification and Regression Training. R package version 6.0-86.
+
+Lander, J., P., 2021. coefplot: Plots Coefficients from Fitted Models. R package version 1.2.7.
+
+Ryan, J., A., and Ulrich, J., M., 2020. quantmod: Quantitative Financial Modelling Framework. R package version 0.4.18.
+
+Wickham, H., 2007. Reshaping data with the reshape package. Journal of Statistical Software, 21(12),
+
+Wickham, H., 2016. ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York.
+
+Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L.D., François, R., Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T.L., Miller, E., Bache, S.M., Müller, K., Ooms, J., Robinson, D., Seidel, D.P., Spinu, V., Takahashi, K., Vaughan, D., Wilke, C., Woo, K., Yutani, H., 2019. Welcome to the tidyverse. Journal of Open Source Software 4, 1686.
+
